@@ -134,6 +134,6 @@ async def main():
     logger.info("🤖 البوت يعمل...")
     await app.run_polling(drop_pending_updates=True)
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(main())
