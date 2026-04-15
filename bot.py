@@ -119,11 +119,11 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 os.remove(path)
 
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help",  help_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(
         MessageHandler(
             filters.VIDEO | filters.Document.VIDEO,
@@ -132,7 +132,7 @@ async def main():
     )
 
     logger.info("🤖 البوت يعمل...")
-    await app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     import asyncio
