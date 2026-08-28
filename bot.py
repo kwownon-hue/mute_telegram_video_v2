@@ -406,6 +406,10 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(commands)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("Set BOT_TOKEN (or TELEGRAM_BOT_TOKEN) before starting the bot")
@@ -421,6 +425,7 @@ def main() -> None:
         asyncio.set_event_loop(loop)
 
     application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("mode", mode_command))
@@ -429,6 +434,7 @@ def main() -> None:
 
     logger.info("Bot is running")
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 
 if __name__ == "__main__":
