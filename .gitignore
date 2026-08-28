@@ -1,0 +1,6 @@
+.env
+*.pickle
+client_secrets*.json
+temp_videos/
+__pycache__/
+*.py[cod]

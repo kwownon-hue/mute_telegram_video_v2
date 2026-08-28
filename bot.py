@@ -1,192 +1,430 @@
-import os
-import logging
-import subprocess
-import uuid
 import asyncio
+import logging
+import os
 import shutil
-from telegram import Update
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
+    CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
-    ContextTypes,
 )
 
-# --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكنك_هنا")
-TEMP_DIR = "temp_videos"
-MAX_SIZE_MB = 50
-CONCURRENT_LIMIT = 3  # Maximum number of videos being processed at once
+from instagram_uploader import InstagramUploader
+from youtube_uploader import YouTubeUploader
 
-# --- Initialization ---
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+default_publisher_dir = BASE_DIR.parent / "youube"
+PUBLISHER_CONFIG_DIR = Path(
+    os.getenv(
+        "PUBLISHER_CONFIG_DIR",
+        str(default_publisher_dir if default_publisher_dir.is_dir() else BASE_DIR),
+    )
+)
+if PUBLISHER_CONFIG_DIR != BASE_DIR:
+    load_dotenv(PUBLISHER_CONFIG_DIR / ".env", override=False)
+os.environ.setdefault("PUBLISHER_CONFIG_DIR", str(PUBLISHER_CONFIG_DIR))
+
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp_videos"))
+if not TEMP_DIR.is_absolute():
+    TEMP_DIR = BASE_DIR / TEMP_DIR
+MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "50"))
+CONCURRENT_LIMIT = int(os.getenv("CONCURRENT_LIMIT", "3"))
+
+MODE_MUTE = "mute"
+MODE_MUTE_YOUTUBE = "mute_youtube"
+MODE_MUTE_INSTAGRAM = "mute_instagram"
+MODE_INSTAGRAM = "instagram"
+DEFAULT_MODE = MODE_MUTE
+
+MODE_LABELS = {
+    MODE_MUTE: "كتم الصوت وإعادة الفيديو",
+    MODE_MUTE_YOUTUBE: "كتم الصوت، إعادة الفيديو، والنشر على يوتيوب",
+    MODE_MUTE_INSTAGRAM: "كتم الصوت والنشر على إنستغرام",
+    MODE_INSTAGRAM: "نشر الفيديو الأصلي على إنستغرام",
+}
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-# Semaphore to control concurrency and prevent CPU exhaustion
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 process_semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+youtube_upload_lock = asyncio.Lock()
+instagram_upload_lock = asyncio.Lock()
 
-async def check_ffmpeg():
-    """Verify that ffmpeg is available in the system path."""
-    if shutil.which("ffmpeg") is None:
-        logger.error("❌ ffmpeg is NOT installed or not in PATH!")
-        return False
-    return True
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 أهلاً!\n\n"
-        "🎬 أرسل لي أي فيديو وسأعيده إليك *بدون صوت* تماماً.\n\n"
-        "⚠️ الحد الأقصى للحجم: 50 ميجابايت.\n"
-        "⚡ جاري العمل بنظام المعالجة المتوازي.",
-        parse_mode="Markdown",
-    )
+def is_allowed(update: Update) -> bool:
+    configured_ids = (
+        os.getenv("ALLOWED_USER_IDS") or os.getenv("ALLOWED_USER_ID", "")
+    ).strip()
+    if not configured_ids:
+        return True
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *كيف تستخدمني؟*\n\n"
-        "1️⃣ أرسل الفيديو مباشرةً أو كـ *ملف* (File)\n"
-        "2️⃣ انتظر ثوانٍ قليلة\n"
-        "3️⃣ استلم الفيديو الصامت ✅\n\n"
-        "💡 يدعم البوت صيغ MP4, MKV, MOV وغيرها.",
-        parse_mode="Markdown",
-    )
+    allowed_ids = {item.strip() for item in configured_ids.split(",") if item.strip()}
+    return bool(update.effective_user and str(update.effective_user.id) in allowed_ids)
 
-async def remove_audio(input_path: str, output_path: str) -> bool:
-    """Removes audio from a video file using ffmpeg asynchronously."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-an",
-        "-c:v", "copy",
-        output_path,
-    ]
-    
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+
+def selected_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("mode", DEFAULT_MODE)
+
+
+def mode_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for mode, label in MODE_LABELS.items():
+        marker = "[x]" if mode == current_mode else "[ ]"
+        buttons.append(
+            [InlineKeyboardButton(f"{marker} {label}", callback_data=f"mode:{mode}")]
         )
-        
-        # Wait for the process to complete with a timeout (e.g., 5 minutes)
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
-            if process.returncode == 0:
-                return True
-            else:
-                logger.error(f"FFmpeg failed with code {process.returncode}: {stderr.decode()}")
-                return False
-        except asyncio.TimeoutError:
-            process.kill()
-            logger.error("FFmpeg process timed out")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error running FFmpeg: {e}")
-        return False
+    return InlineKeyboardMarkup(buttons)
 
-async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+def parse_caption(caption: str) -> tuple[str, str, list[str]]:
+    lines = [line.strip() for line in caption.strip().splitlines()]
+    title = lines[0] if lines else "فيديو جديد"
+    description = "\n".join(lines[1:]).strip() if lines else ""
+    tags = [word[1:] for word in caption.split() if word.startswith("#") and len(word) > 1]
+    return title[:100], description, tags
+
+
+def format_error(error: object) -> str:
+    text = " ".join(str(error).split()) or "Unknown error"
+    return text if len(text) <= 250 else f"{text[:247]}..."
+
+
+def find_ffmpeg() -> Optional[str]:
+    configured_path = os.getenv("FFMPEG_PATH")
+    if configured_path:
+        resolved_path = shutil.which(configured_path)
+        if resolved_path:
+            return resolved_path
+        if Path(configured_path).is_file():
+            return configured_path
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError):
+        return None
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("غير مصرح لك باستخدام هذا البوت.")
+        return
+
+    mode = selected_mode(context)
+    await update.message.reply_text(
+        "أرسل فيديو مباشرة أو كملف.\n\n"
+        f"الوضع الحالي: {MODE_LABELS[mode]}\n"
+        f"الحد الأقصى للحجم: {MAX_SIZE_MB} ميجابايت\n\n"
+        "استخدم /mode لاختيار ما يفعله البوت بكل فيديو."
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("غير مصرح لك باستخدام هذا البوت.")
+        return
+    await update.message.reply_text(
+        "1. استخدم /mode واختر الإجراء المطلوب.\n"
+        "2. أرسل الفيديو مباشرة أو كملف فيديو.\n"
+        "3. يستخدم يوتيوب وإنستغرام النصوص الثابتة من المشروع القديم.\n\n"
+        "الأوامر: /start و /mode و /help"
+    )
+
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("غير مصرح لك باستخدام هذا البوت.")
+        return
+
+    mode = selected_mode(context)
+    await update.message.reply_text(
+        f"اختر وضع العمل. الوضع الحالي: {MODE_LABELS[mode]}",
+        reply_markup=mode_keyboard(mode),
+    )
+
+
+async def handle_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    if not is_allowed(update):
+        await query.edit_message_text("غير مصرح لك باستخدام هذا البوت.")
+        return
+
+    mode = query.data.removeprefix("mode:")
+    if mode not in MODE_LABELS:
+        await query.edit_message_text("اختيار غير صالح.")
+        return
+
+    context.user_data["mode"] = mode
+    await query.edit_message_text(
+        f"تم اختيار الوضع: {MODE_LABELS[mode]}",
+        reply_markup=mode_keyboard(mode),
+    )
+
+
+async def remove_audio(input_path: Path, output_path: Path) -> None:
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is unavailable")
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+    except asyncio.TimeoutError as error:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("Video processing timed out") from error
+
+    if process.returncode != 0:
+        details = stderr.decode(errors="replace")[-1000:]
+        raise RuntimeError(f"ffmpeg failed: {details}")
+
+
+async def prepare_instagram_video(
+    input_path: Path,
+    output_path: Path,
+    mute: bool,
+) -> None:
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is unavailable")
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+    ]
+    if mute:
+        command.append("-an")
+    else:
+        command.extend(["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"])
+    command.extend(
+        [
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=900)
+    except asyncio.TimeoutError as error:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("Instagram video conversion timed out") from error
+
+    if process.returncode != 0:
+        details = stderr.decode(errors="replace")[-1000:]
+        raise RuntimeError(f"Instagram video conversion failed: {details}")
+
+
+async def send_muted_video(message, path: Path) -> None:
+    with path.open("rb") as video:
+        await message.reply_video(
+            video=video,
+            caption="تمت إزالة الصوت بنجاح.",
+            supports_streaming=True,
+            read_timeout=300,
+            write_timeout=300,
+        )
+
+
+async def publish_youtube(path: Path, title: str, description: str, tags: list[str]) -> str:
+    async with youtube_upload_lock:
+        uploader = YouTubeUploader.from_environment()
+        return await asyncio.to_thread(uploader.upload, path, title, description, tags)
+
+
+async def publish_instagram(path: Path, caption: str) -> str:
+    async with instagram_upload_lock:
+        uploader = InstagramUploader.from_environment()
+        return await asyncio.to_thread(uploader.publish_reel, path, caption)
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message:
         return
-
-    # Identify the video object
-    if message.video:
-        file_obj = message.video
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith("video"):
-        file_obj = message.document
-    else:
-        await message.reply_text("❌ الرجاء إرسال ملف فيديو صحيح.")
+    if not is_allowed(update):
+        await message.reply_text("غير مصرح لك باستخدام هذا البوت.")
         return
 
-    # Check file size
+    file_obj = message.video
+    if not file_obj and message.document:
+        mime_type = message.document.mime_type or ""
+        if mime_type.startswith("video/"):
+            file_obj = message.document
+
+    if not file_obj:
+        await message.reply_text("الرجاء إرسال ملف فيديو صحيح.")
+        return
     if file_obj.file_size and file_obj.file_size > MAX_SIZE_MB * 1024 * 1024:
-        await message.reply_text(f"❌ حجم الفيديو يتجاوز {MAX_SIZE_MB} ميجابايت.")
+        await message.reply_text(f"حجم الفيديو يتجاوز {MAX_SIZE_MB} ميجابايت.")
         return
 
-    uid = uuid.uuid4().hex[:8]
-    input_path  = os.path.join(TEMP_DIR, f"{uid}_input.mp4")
-    output_path = os.path.join(TEMP_DIR, f"{uid}_muted.mp4")
-
-    status_msg = await message.reply_text("⏳ جاري تحميل الفيديو...")
-
-    try:
-        # Step 1: Download
-        tg_file = await ctx.bot.get_file(file_obj.file_id)
-        await tg_file.download_to_drive(input_path)
-
-        # Step 2: Queue and Process
-        async with process_semaphore:
-            await status_msg.edit_text("🔇 جاري إزالة الصوت ومعالجة الفيديو...")
-            success = await remove_audio(input_path, output_path)
-
-        if not success:
-            await status_msg.edit_text("❌ حدث خطأ أثناء معالجة الفيديو. قد يكون الملف تالفاً أو برنامج المعالجة غير متوفر.")
-            return
-
-        # Step 3: Upload
-        await status_msg.edit_text("📤 جاري إرسال الفيديو الصامت...")
-        
-        with open(output_path, "rb") as f:
-            await message.reply_video(
-                video=f,
-                caption="✅ تم إزالة الصوت بنجاح! 🔇",
-                supports_streaming=True,
-            )
-
-        await status_msg.delete()
-
-    except Exception as e:
-        logger.exception("خطأ غير متوقع في handle_video")
-        await status_msg.edit_text(f"❌ حدث خطأ غير متوقع: {str(e)[:100]}")
-
-    finally:
-        # Cleanup
-        for path in (input_path, output_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as cleanup_err:
-                    logger.warning(f"Failed to delete {path}: {cleanup_err}")
-
-async def main():
-    if not await check_ffmpeg():
-        print("⚠️ Warning: ffmpeg is not installed. The bot will start but video processing will fail.")
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(
-        MessageHandler(
-            filters.VIDEO | filters.Document.VIDEO,
-            handle_video,
-        )
+    mode = selected_mode(context)
+    unique_id = uuid.uuid4().hex
+    input_path = TEMP_DIR / f"{unique_id}_input.mp4"
+    muted_path = TEMP_DIR / f"{unique_id}_muted.mp4"
+    instagram_path = TEMP_DIR / f"{unique_id}_instagram.mp4"
+    status = await message.reply_text(
+        f"جاري تحميل الفيديو...\nالوضع: {MODE_LABELS[mode]}"
     )
+    title, description, tags = parse_caption(message.caption or "")
 
-    logger.info("🤖 البوت يعمل...")
-    # Use the async native way to run polling
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    
-    # Keep the bot running until interrupted
-    # Use an infinite loop to keep the coroutine alive
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        await app.stop()
-        await app.shutdown()
+        telegram_file = await context.bot.get_file(
+            file_obj.file_id,
+            read_timeout=120,
+            connect_timeout=120,
+        )
+        await telegram_file.download_to_drive(
+            input_path,
+            read_timeout=300,
+            connect_timeout=120,
+        )
+
+        upload_path = input_path
+        if mode in (MODE_MUTE, MODE_MUTE_YOUTUBE):
+            async with process_semaphore:
+                await status.edit_text("جاري إزالة الصوت...")
+                await remove_audio(input_path, muted_path)
+            upload_path = muted_path
+        elif mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
+            instagram_muted = mode == MODE_MUTE_INSTAGRAM
+            action = "بدون صوت" if instagram_muted else "مع الصوت"
+            async with process_semaphore:
+                await status.edit_text(
+                    f"جاري تجهيز فيديو متوافق مع إنستغرام {action}..."
+                )
+                await prepare_instagram_video(input_path, instagram_path, instagram_muted)
+            upload_path = instagram_path
+
+        if mode in (MODE_MUTE, MODE_MUTE_YOUTUBE):
+            await status.edit_text("جاري إرسال الفيديو الصامت إلى تيليجرام...")
+            await send_muted_video(message, muted_path)
+
+        if mode == MODE_MUTE_YOUTUBE:
+            await status.edit_text("جاري رفع الفيديو الصامت إلى يوتيوب...")
+            url = await publish_youtube(upload_path, title, description, tags)
+            await status.edit_text(
+                f"تمت إعادة الفيديو الصامت ونشره على يوتيوب:\n{url}"
+            )
+        elif mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
+            action = "الفيديو الصامت" if mode == MODE_MUTE_INSTAGRAM else "الفيديو الأصلي"
+            await status.edit_text(f"جاري نشر {action} على إنستغرام...")
+            media_id = await publish_instagram(upload_path, message.caption or "")
+            await status.edit_text(
+                f"تم نشر {action} على إنستغرام.\nمعرف المنشور: {media_id}"
+            )
+        else:
+            await status.delete()
+    except Exception as error:
+        logger.exception("Video workflow failed in mode %s", mode)
+        await status.edit_text(f"فشلت معالجة الفيديو: {format_error(error)}")
+    finally:
+        for path in (input_path, muted_path, instagram_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                logger.warning("Could not delete %s: %s", path, error)
+
+
+async def post_init(application: Application) -> None:
+    commands = [
+        BotCommand("start", "عرض حالة البوت"),
+        BotCommand("mode", "اختيار إجراء الفيديو"),
+        BotCommand("help", "عرض طريقة الاستخدام"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+
+def main() -> None:
+    if not TOKEN:
+        raise RuntimeError("Set BOT_TOKEN (or TELEGRAM_BOT_TOKEN) before starting the bot")
+    if not find_ffmpeg():
+        raise RuntimeError("ffmpeg is required and must be available in PATH")
+
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("mode", mode_command))
+    application.add_handler(CallbackQueryHandler(handle_mode_choice, pattern=r"^mode:"))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+
+    logger.info("Bot is running")
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         pass
