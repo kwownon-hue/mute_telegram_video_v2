@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import logging
 import os
@@ -12,7 +13,7 @@ from typing import Optional
 from telegram.error import Conflict
 
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -90,6 +91,10 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 process_semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
 youtube_upload_lock = asyncio.Lock()
 instagram_upload_lock = asyncio.Lock()
+
+# ---- Queue for sequential publishing like youube ----
+video_queue: Optional[asyncio.Queue] = None
+QUEUE_DELAY_SECONDS = int(os.getenv("QUEUE_DELAY_SECONDS", "15"))
 
 
 def is_allowed(update: Update) -> bool:
@@ -451,6 +456,29 @@ async def publish_instagram(path: Path, caption: str) -> str:
         return await asyncio.to_thread(uploader.publish_reel, path, caption)
 
 
+async def _send_status_reply(message, text: str):
+    """Reply directly to original message with ReplyParameters like youube."""
+    return await message.reply_text(
+        text,
+        reply_parameters=ReplyParameters(
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            allow_sending_without_reply=True,
+        ),
+        disable_web_page_preview=True,
+    )
+
+
+async def _update_status_reply(message, status_message, text: str):
+    """Edit status message, or send new one if edit fails."""
+    try:
+        await status_message.edit_text(text, disable_web_page_preview=True)
+        return status_message
+    except Exception as e:
+        logger.warning(f"تعذر تعديل رسالة الحالة: {e}")
+        return await _send_status_reply(message, text)
+
+
 async def _run_video_pipeline(
     input_path: Path,
     message,
@@ -460,62 +488,347 @@ async def _run_video_pipeline(
     title: str,
     description: str,
     tags: list[str],
-) -> None:
-    """Shared pipeline: mute / instagram prep / send / publish. Assumes input_path exists."""
+) -> dict:
+    """Legacy pipeline kept for compatibility, now delegates to process_and_publish with richer reporting."""
+    return await process_and_publish_video(message, input_path, title, description, tags, caption_text, mode, status)
+
+
+async def process_and_publish_video(
+    message,
+    input_path: Path,
+    title: str,
+    description: str,
+    tags: list[str],
+    caption_text: str,
+    mode: str,
+    status,
+) -> dict:
+    """Core pipeline with detailed status like youube. Returns result dict."""
     unique_id = input_path.stem.replace("_input", "").replace("_download", "")
-    # Ensure derived paths use same unique_id stem
     base = TEMP_DIR / unique_id
     muted_path = Path(f"{base}_muted.mp4")
     instagram_path = Path(f"{base}_instagram.mp4")
 
     upload_path: Path = input_path
+    # Results for final report
+    telegram_sent = False
+    telegram_error = None
+    youtube_url = None
+    youtube_error = None
+    instagram_id = None
+    instagram_error = None
+    file_size_mb = 0.0
     try:
+        if input_path.exists():
+            file_size_mb = input_path.stat().st_size / (1024 * 1024)
+    except Exception:
+        pass
+
+    try:
+        # 1) Prepare video per mode
         if mode in (MODE_MUTE, MODE_MUTE_YOUTUBE):
             async with process_semaphore:
-                await status.edit_text("جاري إزالة الصوت...")
+                status = await _update_status_reply(
+                    message, status,
+                    f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n🔧 المرحلة: جاري إزالة الصوت..."
+                )
                 await remove_audio(input_path, muted_path)
             upload_path = muted_path
         elif mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
             instagram_muted = mode == MODE_MUTE_INSTAGRAM
             action = "بدون صوت" if instagram_muted else "مع الصوت"
             async with process_semaphore:
-                await status.edit_text(
-                    f"جاري تجهيز فيديو متوافق مع إنستغرام {action}..."
+                status = await _update_status_reply(
+                    message, status,
+                    f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n🔧 المرحلة: تجهيز إنستغرام {action}..."
                 )
                 await prepare_instagram_video(input_path, instagram_path, instagram_muted)
             upload_path = instagram_path
 
+        # 2) Telegram mute return
         if mode in (MODE_MUTE, MODE_MUTE_YOUTUBE):
-            await status.edit_text("جاري إرسال الفيديو الصامت إلى تيليجرام...")
-            await send_muted_video(message, muted_path)
-
-        if mode == MODE_MUTE_YOUTUBE:
-            await status.edit_text("جاري رفع الفيديو الصامت إلى يوتيوب...")
-            url = await publish_youtube(upload_path, title, description, tags)
-            await status.edit_text(
-                f"تمت إعادة الفيديو الصامت ونشره على يوتيوب:\n{url}"
-            )
-        elif mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
-            action = "الفيديو الصامت" if mode == MODE_MUTE_INSTAGRAM else "الفيديو الأصلي"
-            await status.edit_text(f"جاري نشر {action} على إنستغرام...")
-            # Use original caption_text or default caption from env (uploader handles fallback)
-            media_id = await publish_instagram(upload_path, caption_text or "")
-            await status.edit_text(
-                f"تم نشر {action} على إنستغرام.\nمعرف المنشور: {media_id}"
-            )
-        else:
-            # MODE_MUTE only already sent video above, just clean status
             try:
-                await status.delete()
-            except Exception:
-                pass
+                status = await _update_status_reply(
+                    message, status,
+                    f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n📤 المرحلة: إرسال الفيديو الصامت إلى تيليجرام..."
+                )
+                await send_muted_video(message, muted_path)
+                telegram_sent = True
+            except Exception as e:
+                telegram_error = format_error(e)
+                logger.error(f"Telegram send failed: {e}")
+
+        # 3) YouTube
+        if mode == MODE_MUTE_YOUTUBE:
+            try:
+                status = await _update_status_reply(
+                    message, status,
+                    f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n▶️ المرحلة: رفع إلى يوتيوب..."
+                )
+                youtube_url = await publish_youtube(upload_path, title, description, tags)
+            except Exception as e:
+                youtube_error = format_error(e)
+                logger.error(f"YouTube publish failed: {e}")
+
+        # 4) Instagram
+        if mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
+            try:
+                action = "الفيديو الصامت" if mode == MODE_MUTE_INSTAGRAM else "الفيديو الأصلي"
+                status = await _update_status_reply(
+                    message, status,
+                    f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n📸 المرحلة: نشر {action} على إنستغرام (Cloudinary أولاً)..."
+                )
+                instagram_id = await publish_instagram(upload_path, caption_text or "")
+            except Exception as e:
+                instagram_error = format_error(e)
+                logger.error(f"Instagram publish failed: {e}")
+
     finally:
-        # Cleanup pipeline temps (input_path deletion handled by caller)
         for p in (muted_path, instagram_path):
             try:
                 p.unlink(missing_ok=True)
             except OSError as error:
                 logger.warning("Could not delete %s: %s", p, error)
+
+    # Build final report like youube
+    result_lines: list[str] = []
+    result_lines.append(f"🎬 الوضع: {MODE_LABELS[mode]}")
+
+    if mode in (MODE_MUTE, MODE_MUTE_YOUTUBE):
+        if telegram_sent:
+            result_lines.append("✅ تيليجرام: تم الإرسال (صامت)")
+        else:
+            result_lines.append(f"❌ تيليجرام: {telegram_error or 'فشل'}")
+
+    if mode == MODE_MUTE_YOUTUBE:
+        if youtube_url:
+            result_lines.append(f"▶️ يوتيوب: {youtube_url}")
+        else:
+            result_lines.append(f"▶️ يوتيوب: ❌ {youtube_error or 'فشل'}")
+
+    if mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
+        if instagram_id:
+            # instagram_id is media id; show as link hint
+            result_lines.append(f"📸 إنستغرام: ✅ تم النشر (ID: {instagram_id})")
+        else:
+            result_lines.append(f"📸 إنستغرام: ❌ {instagram_error or 'فشل'}")
+
+    # Determine overall success
+    if mode == MODE_MUTE:
+        success = telegram_sent
+    elif mode == MODE_MUTE_YOUTUBE:
+        success = telegram_sent and youtube_url is not None
+        # partial success considered if at least one platform succeeded for report header?
+        # Keep strict: both need success for ✅ else show partial
+        partial = telegram_sent or youtube_url is not None
+    elif mode in (MODE_MUTE_INSTAGRAM, MODE_INSTAGRAM):
+        success = instagram_id is not None
+        partial = instagram_id is not None
+    else:
+        success = telegram_sent or youtube_url or instagram_id
+
+    if success:
+        header = f"✅ نجح الفيديو [{MODE_LABELS[mode]}]"
+    elif mode == MODE_MUTE_YOUTUBE and (telegram_sent or youtube_url):
+        header = f"⚠️ نجاح جزئي [{MODE_LABELS[mode]}]"
+    else:
+        header = f"❌ فشل الفيديو [{MODE_LABELS[mode]}]"
+
+    # File size & deletion will be added by caller after input cleanup, but add now
+    result_text = "\n".join(result_lines)
+    final = (
+        f"{header}\n"
+        f"📌 العنوان: {title}\n"
+        f"{result_text}\n"
+        f"📦 الحجم: {file_size_mb:.2f} MB"
+    )
+    # This final text will be sent by queue_worker after checking deletion
+    # Here we update status to final immediately (queue_worker will override with deletion info if needed)
+    try:
+        status = await _update_status_reply(message, status, final)
+    except Exception:
+        pass
+
+    return {
+        "telegram_sent": telegram_sent,
+        "telegram_error": telegram_error,
+        "youtube_url": youtube_url,
+        "youtube_error": youtube_error,
+        "instagram_id": instagram_id,
+        "instagram_error": instagram_error,
+        "file_size_mb": file_size_mb,
+        "status_msg": status,
+        "header": header,
+        "result_text": result_text,
+    }
+
+
+# ---- Queue system like C:/Users/MC/Desktop/youube ----
+async def enqueue_video_job(item: dict) -> None:
+    """Add job to queue and reply with position like youube."""
+    global video_queue
+    if video_queue is None:
+        logger.warning("Queue not initialized, processing directly")
+        # Fallback: process directly (should not happen after post_init)
+        return
+    await video_queue.put(item)
+    qsize = video_queue.qsize()
+    message = item["message"]
+    title = item.get("title", "فيديو")
+    mode = item.get("mode", DEFAULT_MODE)
+    if qsize == 1:
+        await _send_status_reply(message, f"📥 تم استلام ({title}) [{MODE_LABELS[mode]}]\n⏳ جاري بدء المعالجة الآن...\n📌 الطابور: #{qsize}")
+    else:
+        await _send_status_reply(message, f"📥 تم استلام ({title}) [{MODE_LABELS[mode]}]\n📌 الترتيب في الطابور: #{qsize}\n⏳ سيتم النشر بالتسلسل تفادياً للحظر.")
+
+
+async def queue_worker(application: Application) -> None:
+    """Background worker processing videos one-by-one with delay."""
+    logger.info("🎬 تم تشغيل عامل طابور الفيديوهات (Queue Worker) بنجاح.")
+    while True:
+        try:
+            item = await video_queue.get()  # type: ignore
+            message = item["message"]
+            kind = item.get("kind")
+            mode = item.get("mode", DEFAULT_MODE)
+            title = item.get("title", "فيديو جديد")
+            description = item.get("description", "")
+            tags = item.get("tags", [])
+            caption_text = item.get("caption_text", "")
+            source_url = item.get("url", "")
+
+            # Initial processing status reply
+            try:
+                if kind == "file":
+                    status_msg = await _send_status_reply(
+                        message,
+                        f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n🔧 المرحلة: بدء المعالجة..."
+                    )
+                else:
+                    status_msg = await _send_status_reply(
+                        message,
+                        f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n🔗 الرابط: {source_url}\n🔧 المرحلة: بدء المعالجة..."
+                    )
+            except Exception as e:
+                logger.warning(f"Could not send status: {e}")
+                status_msg = None  # fallback handled inside
+
+            input_path: Optional[Path] = None
+            dl_id: Optional[str] = None
+            file_size_mb = 0.0
+            input_created = False
+            try:
+                # Download phase
+                if kind == "file":
+                    file_id = item["file_id"]
+                    unique_id = uuid.uuid4().hex
+                    input_path = TEMP_DIR / f"{unique_id}_input.mp4"
+                    if status_msg:
+                        status_msg = await _update_status_reply(
+                            message, status_msg,
+                            f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n📥 المرحلة: جاري التحميل من تيليجرام..."
+                        )
+                    tg_file = await application.bot.get_file(file_id, read_timeout=120, connect_timeout=120)
+                    await tg_file.download_to_drive(input_path, read_timeout=300, connect_timeout=120)
+                    input_created = True
+                elif kind == "link":
+                    url = item["url"]
+                    unique_id = uuid.uuid4().hex
+                    dl_id = f"{unique_id}_download"
+                    if status_msg:
+                        status_msg = await _update_status_reply(
+                            message, status_msg,
+                            f"⏳ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n📥 المرحلة: جاري التحميل من الرابط...\n{url}"
+                        )
+                    downloaded = await download_from_url(url, TEMP_DIR, dl_id)
+                    input_path = downloaded
+                    input_created = True
+                    if not input_path.exists():
+                        raise RuntimeError("Downloaded file not found")
+                else:
+                    raise RuntimeError(f"Unknown job kind: {kind}")
+
+                if input_path and input_path.exists():
+                    if input_path.stat().st_size > MAX_SIZE_MB * 1024 * 1024:
+                        if status_msg:
+                            await _update_status_reply(
+                                message, status_msg,
+                                f"❌ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n📦 الحجم يتجاوز {MAX_SIZE_MB} ميجابايت."
+                            )
+                        continue
+                    file_size_mb = input_path.stat().st_size / (1024 * 1024)
+
+                if input_path is None or not input_path.exists():
+                    raise RuntimeError("Input file missing after download")
+
+                # Now publish via pipeline (which also updates status)
+                result = await process_and_publish_video(message, input_path, title, description, tags, caption_text, mode, status_msg)
+                status_msg = result.get("status_msg", status_msg)
+                # Now final message with deletion status
+                # File will be deleted in finally, but we can report size
+                # Append deletion info
+                deletion_line = "🗑️ الحذف المحلي: سيتم ✅"
+                # Build final status with deletion note (actual deletion happens next)
+                # We update again to include deletion expectation
+                final_header = result.get("header", "")
+                final_text = result.get("result_text", "")
+                final_with_deletion = (
+                    f"{final_header}\n"
+                    f"📌 العنوان: {title}\n"
+                    f"{final_text}\n"
+                    f"📦 الحجم: {file_size_mb:.2f} MB\n"
+                    f"{deletion_line}"
+                )
+                if status_msg:
+                    try:
+                        await _update_status_reply(message, status_msg, final_with_deletion)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.exception("Queue job failed [%s] mode %s", title, mode)
+                err_text = format_error(e)
+                hint = ""
+                low = str(e).lower()
+                if "unsupported url" in low:
+                    hint = "\nالرابط غير مدعوم."
+                elif "private" in low or "login" in low:
+                    hint = "\nقد يحتاج كوكيز."
+                if status_msg:
+                    try:
+                        await _update_status_reply(
+                            message, status_msg,
+                            f"❌ [{MODE_LABELS[mode]}]\n📌 العنوان: {title}\n💬 السبب: {err_text}{hint}\n📦 الحجم: {file_size_mb:.2f} MB"
+                        )
+                    except Exception:
+                        pass
+            finally:
+                # Cleanup input file (always, even if download failed mid-way)
+                if input_path is not None:
+                    try:
+                        if input_path.exists():
+                            input_path.unlink(missing_ok=True)
+                    except OSError as ex:
+                        logger.warning("Could not delete %s: %s", input_path, ex)
+                if dl_id is not None:
+                    for p in TEMP_DIR.glob(f"{dl_id}.*"):
+                        try:
+                            p.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+                video_queue.task_done()  # type: ignore
+                if not video_queue.empty():  # type: ignore
+                    delay = QUEUE_DELAY_SECONDS
+                    logger.info(f"⏳ الانتظار {delay} ثوانٍ قبل الفيديو التالي...")
+                    await asyncio.sleep(delay)
+
+        except asyncio.CancelledError:
+            logger.info("🛑 تم إيقاف عامل الطابور.")
+            break
+        except Exception as e:
+            logger.error(f"❌ خطأ في الطابور: {e}", exc_info=True)
+            await asyncio.sleep(5)
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -540,42 +853,20 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     mode = selected_mode(context)
-    unique_id = uuid.uuid4().hex
-    input_path = TEMP_DIR / f"{unique_id}_input.mp4"
-    status = await message.reply_text(
-        f"جاري تحميل الفيديو...\nالوضع: {MODE_LABELS[mode]}"
-    )
     title, description, tags = parse_caption(message.caption or "")
     caption_text = message.caption or ""
 
-    try:
-        telegram_file = await context.bot.get_file(
-            file_obj.file_id,
-            read_timeout=120,
-            connect_timeout=120,
-        )
-        await telegram_file.download_to_drive(
-            input_path,
-            read_timeout=300,
-            connect_timeout=120,
-        )
-
-        if input_path.stat().st_size > MAX_SIZE_MB * 1024 * 1024:
-            await status.edit_text(f"حجم الفيديو يتجاوز {MAX_SIZE_MB} ميجابايت.")
-            return
-
-        await _run_video_pipeline(input_path, message, status, mode, caption_text, title, description, tags)
-    except Exception as error:
-        logger.exception("Video workflow failed in mode %s", mode)
-        try:
-            await status.edit_text(f"فشلت معالجة الفيديو: {format_error(error)}")
-        except Exception:
-            pass
-    finally:
-        try:
-            input_path.unlink(missing_ok=True)
-        except OSError as error:
-            logger.warning("Could not delete %s: %s", input_path, error)
+    item = {
+        "kind": "file",
+        "file_id": file_obj.file_id,
+        "message": message,
+        "mode": mode,
+        "title": title,
+        "description": description,
+        "tags": tags,
+        "caption_text": caption_text,
+    }
+    await enqueue_video_job(item)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -598,71 +889,33 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     mode = selected_mode(context)
 
-    for idx, url in enumerate(urls):
-        unique_id = uuid.uuid4().hex
-        status = await message.reply_text(
-            f"[{idx+1}/{len(urls)}] جاري تحميل الرابط...\n{url}\nالوضع: {MODE_LABELS[mode]}"
-        )
-        dl_id = f"{unique_id}_download"
-        input_path = None
-        try:
-            await status.edit_text(f"[{idx+1}/{len(urls)}] جاري التحميل من الرابط...\n{url}")
-            downloaded = await download_from_url(url, TEMP_DIR, dl_id)
-            input_path = downloaded
-
-            if not input_path.exists():
-                raise RuntimeError("Downloaded file not found")
-
-            if input_path.stat().st_size > MAX_SIZE_MB * 1024 * 1024:
-                await status.edit_text(
-                    f"حجم الفيديو المحمل يتجاوز {MAX_SIZE_MB} ميجابايت.\n{url}"
-                )
-                continue
-
-            await status.edit_text(f"[{idx+1}/{len(urls)}] تم التحميل، جاري المعالجة...\n{url}")
-            await _run_video_pipeline(input_path, message, status, mode, caption_text, title, description, tags)
-
-        except Exception as error:
-            logger.exception("Link workflow failed for %s in mode %s", url, mode)
-            err_text = format_error(error)
-            hint = ""
-            lower_err = str(error).lower()
-            if "unsupported url" in lower_err or "unsupported" in lower_err:
-                hint = "\nالرابط غير مدعوم من yt-dlp."
-            elif "private" in lower_err or "login" in lower_err:
-                hint = "\nالفيديو خاص ويحتاج كوكيز."
-            elif "403" in lower_err or "401" in lower_err:
-                hint = "\nتم رفض الوصول (قد يحتاج كوكيز انستغرام)."
-            try:
-                await status.edit_text(f"فشل معالجة الرابط:\n{url}\n{err_text}{hint}")
-            except Exception:
-                pass
-        finally:
-            if input_path is not None:
-                try:
-                    input_path.unlink(missing_ok=True)
-                except OSError as e:
-                    logger.warning("Could not delete %s: %s", input_path, e)
-                for p in TEMP_DIR.glob(f"{dl_id}.*"):
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            else:
-                for p in TEMP_DIR.glob(f"{dl_id}.*"):
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+    for url in urls:
+        item = {
+            "kind": "link",
+            "url": url,
+            "message": message,
+            "mode": mode,
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "caption_text": caption_text,
+        }
+        await enqueue_video_job(item)
 
 
 async def post_init(application: Application) -> None:
+    global video_queue
     commands = [
         BotCommand("start", "عرض حالة البوت"),
         BotCommand("mode", "اختيار إجراء الفيديو"),
         BotCommand("help", "عرض طريقة الاستخدام"),
     ]
     await application.bot.set_my_commands(commands)
+    # Init queue like youube main.py:875-880
+    if video_queue is None:
+        video_queue = asyncio.Queue()
+        asyncio.create_task(queue_worker(application))
+        logger.info("⚡ تم إعداد طابور الفيديوهات وبدء معالجة المهام (queue).")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
