@@ -412,6 +412,14 @@ def main() -> None:
     if not find_ffmpeg():
         raise RuntimeError("ffmpeg is required and must be available in PATH")
 
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -428,3 +436,4 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, SystemExit):
         pass
+
