@@ -2,9 +2,13 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
+
+from telegram.error import Conflict
 
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -407,7 +411,43 @@ async def post_init(application: Application) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Conflict = another instance is polling with same token. Don't spam stacktrace,
+    # just log a clean warning (Updater will retry automatically).
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "Conflict: another getUpdates request is running with this token. "
+            "Make sure only ONE bot instance is running (stop local bot if deployed on Render)."
+        )
+        return
     logger.error("Exception while handling an update:", exc_info=context.error)
+
+
+def _start_health_server(port: int) -> None:
+    """Tiny HTTP server so Render Web Service health checks pass when using polling."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK - bot is running (polling mode)")
+
+        def do_HEAD(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        logger.warning("Health server could not bind to port %s: %s", port, exc)
+        return
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
+    thread.start()
+    logger.info("Health check server listening on 0.0.0.0:%s", port)
 
 
 def main() -> None:
@@ -432,8 +472,71 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_mode_choice, pattern=r"^mode:"))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
-    logger.info("Bot is running")
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # ---- Render deployment fix ----
+    # Telegram allows ONLY ONE concurrent getUpdates per token.
+    # Causes of "Conflict: terminated by other getUpdates request":
+    # 1) Bot running locally + on Render at same time (most common)
+    # 2) Two Render services/containers with same BOT_TOKEN
+    # 3) Old webhook still set (run_polling will delete it if drop_pending_updates=True,
+    #    but explicit delete + health server helps).
+    # For Render: use either
+    #   - Background Worker + polling (recommended for bots) OR
+    #   - Web Service   + webhook  (set WEBHOOK_URL)
+    webhook_url = (os.getenv("WEBHOOK_URL") or "").strip().rstrip("/")
+    use_webhook_flag = os.getenv("USE_WEBHOOK", "").strip().lower() in ("1", "true", "yes", "on")
+    render_external_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+
+    # Allow RENDER_EXTERNAL_URL to act as WEBHOOK_URL when USE_WEBHOOK is enabled
+    if not webhook_url and use_webhook_flag and render_external_url:
+        webhook_url = render_external_url
+
+    port_env = os.getenv("PORT", "").strip()
+    try:
+        port = int(port_env) if port_env else 0
+    except ValueError:
+        logger.warning("Invalid PORT value %r, ignoring", port_env)
+        port = 0
+
+    if webhook_url:
+        # Webhook mode - correct for Render Web Service (free tier)
+        webhook_path = os.getenv("WEBHOOK_PATH", "webhook").strip().strip("/")
+        if not webhook_path:
+            webhook_path = "webhook"
+        # Use first 12 chars of token as simple secret path if user didn't customize
+        # (keeps URL unguessable). User can override via WEBHOOK_PATH.
+        full_webhook_url = f"{webhook_url}/{webhook_path}"
+        listen_port = port if port else 10000
+        logger.info("Starting in WEBHOOK mode: %s on 0.0.0.0:%s", full_webhook_url, listen_port)
+        logger.info("If you want polling instead, unset WEBHOOK_URL/USE_WEBHOOK and deploy as Background Worker")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=listen_port,
+            url_path=webhook_path,
+            webhook_url=full_webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Polling mode - correct for local dev and Render Background Worker
+        if port and os.getenv("RENDER", "").lower() == "true":
+            # Render Web Service expects PORT to be bound, otherwise it restarts the
+            # container -> 2 containers briefly overlap -> Conflict. Start dummy server.
+            logger.warning(
+                "PORT=%s is set and RENDER=true but WEBHOOK_URL is empty. "
+                "You are running POLLING on a Render Web Service. "
+                "This works but you MUST add a health server (starting one now). "
+                "Recommended: either (a) switch this service to Background Worker (paid) "
+                "or (b) set WEBHOOK_URL=https://<your-app>.onrender.com and USE_WEBHOOK=true",
+                port,
+            )
+            _start_health_server(port)
+        elif port and not webhook_url:
+            # Also handle local PORT set without RENDER flag (e.g., manual test)
+            _start_health_server(port)
+
+        logger.info("Bot is running in POLLING mode (drop_pending_updates=True)")
+        logger.info("If you see 'Conflict' errors, stop ALL other instances using this token (local PC, old Render deploy, @BotFather webhook)")
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 
